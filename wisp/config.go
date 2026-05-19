@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 )
 
 type FilterList struct {
@@ -25,8 +26,16 @@ type Config struct {
 	TcpBufferSize int  `json:"tcpBufferSize"`
 	TcpNoDelay    bool `json:"tcpNoDelay"`
 
-	Blacklist FilterList `json:"blacklist"`
-	Whitelist FilterList `json:"whitelist"`
+	Blacklist struct {
+		Hostnames map[string]struct{}
+		Ports     map[uint16]struct{}
+	}
+	Whitelist struct {
+		Hostnames map[string]struct{}
+		Ports     map[uint16]struct{}
+	}
+
+	WebsocketPermessageDeflate bool
 
 	DnsServers     []string `json:"dnsServers"`
 	DnsMethod      string   `json:"dnsMethod"`
@@ -54,9 +63,10 @@ type Config struct {
 
 	BufferRemainingLength uint32 `json:"bufferRemainingLength"`
 
-	Logger   Logger
-	DNSCache *DNSCache
-	Dialer   net.Dialer
+	Logger      Logger
+	DNSCache    *DNSCache
+	ReadBufPool *sync.Pool
+	Dialer      net.Dialer
 }
 
 func DefaultConfig() Config {
@@ -72,15 +82,6 @@ func DefaultConfig() Config {
 
 		TcpBufferSize: 32768,
 		TcpNoDelay:    true,
-
-		Blacklist: FilterList{
-			Hostnames: []string{},
-			Ports:     []interface{}{},
-		},
-		Whitelist: FilterList{
-			Hostnames: []string{},
-			Ports:     []interface{}{},
-		},
 
 		DnsServers:     []string{},
 		DnsMethod:      "resolve",
@@ -109,7 +110,7 @@ func DefaultConfig() Config {
 	}
 }
 
-func CreateWispConfig(cfg Config) *Config {
+func CreateWispConfig(cfg *Config) *Config {
 	wispCfg := &Config{
 		AllowTCP: cfg.AllowTCP,
 		AllowUDP: cfg.AllowUDP,

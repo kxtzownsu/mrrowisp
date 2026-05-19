@@ -9,8 +9,6 @@ import (
 
 var errorInvalid = errors.New("invalid wisp v2 payload")
 
-const v2HandshakeTimeout = 15 * time.Second
-
 type extensions struct {
 	udp           bool
 	streamConfirm bool
@@ -70,10 +68,7 @@ func parseClientInfo(payload []byte) (*extensions, error) {
 	exts := &extensions{}
 	data := payload[2:]
 
-	for len(data) > 0 {
-		if len(data) < 5 {
-			return nil, errorInvalid
-		}
+	for len(data) >= 5 {
 		extID := data[0]
 		extLen := binary.LittleEndian.Uint32(data[1:5])
 		data = data[5:]
@@ -129,7 +124,6 @@ func parseClientInfo(payload []byte) (*extensions, error) {
 
 func (c *wispConnection) v2Handshake() {
 	c.handshakeDone = make(chan struct{})
-	_ = c.netConn.SetReadDeadline(time.Now().Add(v2HandshakeTimeout))
 
 	infoPayload := c.buildServerInfoPacket()
 	c.sendRawFrame(infoPayload)

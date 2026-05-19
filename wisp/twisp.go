@@ -91,7 +91,9 @@ func handleTwisp(wc *wispConnection, streamId uint32, command string) {
 
 func (ts *twispStream) readPty() {
 	const maxHeaderLen = 15
-	buf := make([]byte, maxHeaderLen+65535)
+	bufPool := ts.wispConn.config.ReadBufPool.Get().(*[]byte)
+	buf := *bufPool
+	defer ts.wispConn.config.ReadBufPool.Put(bufPool)
 
 	streamId := ts.streamId
 

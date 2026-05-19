@@ -39,7 +39,7 @@ func main() {
 		cfg.AllowLoopbackIPs = *fAllowLoopbackIPs
 	}
 
-	wispConfig := wisp.CreateWispConfig(cfg)
+	wispConfig := wisp.CreateWispConfig(&cfg)
 
 	wispHandler := wisp.CreateWispHandler(wispConfig)
 

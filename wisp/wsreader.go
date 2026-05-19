@@ -16,9 +16,6 @@ func (c *wispConnection) readLoop() {
 	var headerBuffer [14]byte
 
 	for {
-		// if c.config != nil && c.config.FrameReadTimeout > 0 {
-		// 	_ = c.netConn.SetReadDeadline(time.Now().Add(c.config.FrameReadTimeout))
-		// }
 		if _, err := io.ReadFull(reader, headerBuffer[:2]); err != nil {
 			return
 		}

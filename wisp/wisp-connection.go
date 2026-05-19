@@ -4,53 +4,17 @@ import (
 	"encoding/binary"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
-
-	prot "mrrowisp/wisp/protection"
 )
-
-const (
-	maxConnectsPerSecond = 20
-	connectRateWindow    = time.Second
-	minFramePoolCap      = 64 * 1024
-)
-
-type connectRateLimiter struct {
-	mutex       sync.Mutex
-	windowStart time.Time
-	count       int
-	limit       int
-}
-
-func newConnectRateLimiter(limit int) *connectRateLimiter {
-	if limit <= 0 {
-		limit = maxConnectsPerSecond
-	}
-	return &connectRateLimiter{windowStart: time.Now(), limit: limit}
-}
-
-func (r *connectRateLimiter) allow() bool {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	now := time.Now()
-	if now.Sub(r.windowStart) >= connectRateWindow {
-		r.windowStart = now
-		r.count = 0
-	}
-	r.count++
-	return r.count <= r.limit
-}
 
 type writeReq struct {
 	data []byte
 	pool bool
 }
-
-const maxConcurrentDials = 50
-const maxPendingStreamBytes = 16 * 1024 * 1024
 
 type wispConnection struct {
 	netConn        net.Conn
@@ -62,7 +26,6 @@ type wispConnection struct {
 	shutdownOnce   sync.Once
 	config         *Config
 	twispStreams   *twispRegistry
-	connectLimiter *connectRateLimiter
 	remoteIP       string
 
 	isV2          bool
@@ -71,47 +34,31 @@ type wispConnection struct {
 	v2Challenge   []byte
 	authenticated atomic.Bool
 
-	dialSem        chan struct{}
-	closeCh        chan struct{}
-	createdAt      time.Time
-	packetLimiter  *prot.PacketRateLimiter
-	inboundLimiter *prot.InboundRateLimiter
-	streamCount    atomic.Int32
+	dialSem     chan struct{}
+	closeCh     chan struct{}
+	createdAt   time.Time
+	streamCount atomic.Int32
 }
 
 func (c *wispConnection) close() {
-	c.shutdownOnce.Do(func() {
-		c.isClosed.Store(true)
-		close(c.closeCh)
-		c.netConn.Close()
-	})
+	if !c.isClosed.CompareAndSwap(false, true) {
+		return
+	}
+	c.netConn.Close()
 }
 
 func (c *wispConnection) writeLoop() {
 	for req := range c.writeCh {
-		reqs := []writeReq{req}
+		bufs := net.Buffers{req.data}
 		n := len(c.writeCh)
 		for i := 0; i < n; i++ {
-			reqs = append(reqs, <-c.writeCh)
-		}
-		bufs := make(net.Buffers, 0, len(reqs))
-		for _, r := range reqs {
+			r := <-c.writeCh
 			bufs = append(bufs, r.data)
 		}
-		// if cfg.config != nil {
-		// 	_ = cfg.netConn.SetWriteDeadline(time.Now().Add(cfg.config.WriteTimeout))
-		// }
 		if _, err := bufs.WriteTo(c.netConn); err != nil {
-			c.close()
+			c.isClosed.Store(true)
+			c.netConn.Close()
 			return
-		}
-		// if cfg.config != nil && cfg.config.WriteTimeout > 0 {
-		// 	_ = cfg.netConn.SetWriteDeadline(time.Time{})
-		// }
-		for _, r := range reqs {
-			if r.pool {
-				c.releaseFrame(r.data)
-			}
 		}
 	}
 }
@@ -152,7 +99,7 @@ func (c *wispConnection) releaseFrame(data []byte) {
 	if c.config == nil || len(data) == 0 {
 		return
 	}
-	if cap(data) < minFramePoolCap {
+	if cap(data) < 64*1024 {
 		return
 	}
 	buf := data
@@ -188,18 +135,16 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 	if len(payload) < 3 {
 		return
 	}
-	guard := newProtection(c.config)
 	streamType := payload[0]
 	port := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(payload[1:3])), 10)
 	hostname := string(payload[3:])
 
 	c.config.Logger.Debug("creating stream", "ip", c.remoteIP, "streamId", streamId, "hostname", hostname, "port", port, "type", streamType)
-	action, normalizedHostname, reason := guard.allowConnect(c, streamType, hostname, port)
-	if action == connectBlocked {
-		c.sendClosePacket(streamId, reason)
-		return
-	}
-	if action == connectTwisp {
+	if streamType == streamTypeTerm {
+		if !c.config.EnableTwisp {
+			c.sendClosePacket(streamId, closeReasonBlocked)
+			return
+		}
 		go handleTwisp(c, streamId, hostname)
 		return
 	}
@@ -208,7 +153,7 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 		wispConn:  c,
 		streamId:  streamId,
 		connReady: make(chan struct{}),
-		hostname:  normalizedHostname,
+		hostname:  strings.ToLower(strings.TrimSpace(hostname)),
 	}
 	stream.isOpen.Store(true)
 
@@ -218,23 +163,10 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 	}
 
 	c.streamCount.Add(1)
-	go stream.handleConnect(streamType, port, normalizedHostname)
+	go stream.handleConnect(streamType, port, hostname)
 }
 
 func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
-	guard := newProtection(c.config)
-	if c.packetLimiter != nil && !c.packetLimiter.Allow() {
-		c.sendClosePacket(streamId, closeReasonThrottled)
-		return
-	}
-	if c.inboundLimiter != nil && !c.inboundLimiter.Allow(len(payload)) {
-		c.sendClosePacket(streamId, closeReasonThrottled)
-		return
-	}
-	if !guard.allowMessageSize(len(payload)) {
-		c.sendClosePacket(streamId, closeReasonInvalidInfo)
-		return
-	}
 	var stream *wispStream
 	if c.cachedStreamId == streamId {
 		stream = (*wispStream)(atomic.LoadPointer(&c.cachedStream))
@@ -265,7 +197,7 @@ func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
 
 	stream.pendingMutex.Lock()
 	if !stream.connReadyDone.Load() {
-		if stream.pendingBytes+len(payload) > maxPendingStreamBytes {
+		if stream.pendingBytes+len(payload) > 16*1024*1024 {
 			stream.pendingMutex.Unlock()
 			stream.close(closeReasonThrottled)
 			return
@@ -288,7 +220,7 @@ func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
 	if stream.streamType == streamTypeTCP {
 		stream.bufferRemaining--
 		if stream.bufferRemaining == 0 {
-			// stream.bufferRemaining = c.config.BufferRemainingLength
+			stream.bufferRemaining = c.config.BufferRemainingLength
 			c.sendPacket(streamId, stream.bufferRemaining)
 		}
 	}
