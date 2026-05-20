@@ -38,7 +38,7 @@ if [ ! -d "dist" ]; then
     exit 1
 fi
 
+cp package.json README.md LICENSE dist/
 cp example.config.json dist/config.json
-cp LICENSE README.md dist/ 2>/dev/null || true
 
 echo "Finished copying package files to ./dist/"
