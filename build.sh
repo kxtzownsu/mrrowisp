@@ -28,6 +28,7 @@ for os in linux darwin win32; do
         fi
         mkdir -p bin/${os}-${arch}
         GOOS=$goos GOARCH=$goarch go build -o ./bin/${os}-${arch}/mrrowisp${ext} main.go
+        chmod +x ./bin/${os}-${arch}/mrrowisp${ext}
     done
 done
 
