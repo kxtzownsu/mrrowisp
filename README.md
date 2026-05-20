@@ -1,242 +1,125 @@
-![night chan](https://raw.githubusercontent.com/starlightdevgroup/mrrowisp/main/night%20chan.png)
+# mrrowisp
 
-it has the zoomies
+A [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) server written in Go,
+with a Node.js wrapper for spawning and load-balancing across multiple
+worker processes.
 
-so quick story abt how this was made, this was the initial project, then amplify made me write a whole new wisp library, then i scrapped that and wrote this in rust. this has still been faster than all of them. every single time.
-
-> [!WARNING]
-> Twisp, and by extension mrrowisp, does NOT work on windows! linux and macos supported tho
+mrrowisp supports Wisp v1, v2, and optionally Twisp (PTY over Wisp). It includes
+flood protection, per-source/per-destination rate limiting, IP scoring, an egress
+allow/deny policy, a DNS cache, and reverse-proxy IP parsing.
 
 ## Features
 
-- Wisp v1 and v2 protocol support
-- TCP and UDP stream multiplexing over WebSocket
-- Twisp (terminal over wisp) support for remote shell access
-- Password and Ed25519 certificate authentication (v2)
-- Hostname blacklist/whitelist filtering
-- SOCKS5 proxy support for upstream connections
-- Custom DNS server with caching
-- WebSocket permessage-deflate compression
-- Configurable TCP buffer sizes and flow control
+- Wisp v1 and v2 (`enableV2`) over WebSocket
+- Optional Twisp (`enableTwisp`)
+- TCP and UDP stream support (`allowTCP`, `allowUDP`)
+- Hostname/port allow and block lists
+- Direct IP, private IP, and loopback egress controls
+- Flood protection: per-source, per-destination, SYN flood detection
+- IP reputation with on-disk persistence and decay
+- Bandwidth and connection rate limits per IP
+- Optional password authentication
+- Optional upstream HTTP/SOCKS proxy
+- Reverse-proxy real-IP parsing (`CF-Connecting-IP`, `X-Forwarded-For`, ...)
+- Optional static file serving alongside the `/wisp` endpoint
 
-## Installation
+## Installing
 
-### Go Binary
+### From source (Go)
 
-```bash
-go build -o mrrowisp
+Requires Go 1.25+.
+
+```sh
+go build -o mrrowisp main.go
 ```
 
-### Node / Bun
+Or build cross-platform binaries into `./bin/`:
 
-```bash
-bun add mrrowisp
-# or
-npm install mrrowisp
+```sh
+./build.sh
 ```
 
-## Usage
+### Docker
 
-### TypeScript / JavaScript
+```sh
+docker build -t mrrowisp .
+docker run -p 6001:6001 -v $(pwd)/config.json:/app/config.json mrrowisp
+```
+
+### npm / pnpm (Node.js wrapper)
+
+```sh
+pnpm install mrrowisp
+```
+
+## Running the standalone server
+
+```sh
+./mrrowisp --config config.json
+```
+
+Flags:
+
+- `--config <path|json>` – path to a config file or an inline JSON string
+- `--port <n>` – override the port from config
+- `--allow-loopback` – override `allowLoopbackIPs`
+
+If no `--config` is supplied, the built-in defaults from
+`wisp.DefaultConfig()` are used.
+
+See `example.config.json` for the full list of supported options.
+
+## Using the Node.js wrapper
+
+The wrapper spawns one or more `mrrowisp` Go processes and the built-in load
+balancing routes incoming WebSocket upgrades across them.
 
 ```ts
-import { createMrrowisp } from "mrrowisp";
+import { Mrrowisp } from "mrrowisp";
+import { createServer } from "node:http";
 
-// Basic start and stop
-const server = await createMrrowisp()
-	.port(6001)
-	.v2(true)
-	.start();
+const wisp = new Mrrowisp({ port: 6001, logLevel: "info" });
+await wisp.start(4); // spawn 4 workers, which would route to 6001, 6002, 6003, and 6004 or similar automatically
 
-// later
-await server.stop();
+const server = createServer();
+server.on("upgrade", (req, socket, head) => wisp.route(req, socket, head));
+server.listen(8080);
 ```
 
-#### Configuration
+API:
 
-```ts
-const server = await createMrrowisp()
-	.port(6001)
-	.v2(true)
-	.udp(true)
-	.twisp(true)
-	.motd("mrrow merp purr :3")
-	.blacklist(["truthsocial.com"]) // idk i'd block this
-	.dns(["8.8.8.8","1.1.1.1"])
-	.start();
-```
-
-#### Event Handlers
-
-```ts
-const server = await createMrrowisp()
-	.port(6001)
-	.onReady(() => {
-		console.log("Server is ready!");
-	})
-	.onError((err) => {
-		console.error("Server error:", err);
-	})
-	.onExit((code, signal) => {
-		console.log(`Server exited (code: ${code}, signal: ${signal})`);
-	})
-	.onStdout((data) => {
-		console.log(`[mrrowisp] ${data}`);
-	})
-	.onStderr((data) => {
-		console.error(`[mrrowisp] ${data}`);
-	})
-	.start();
-
-server.on("error", (err) => console.error(err));
-server.on("exit", (code) => console.log(`Exit: ${code}`));
-```
-
-#### Loading Config
-
-```ts
-// Load from a config file
-const server = await createMrrowisp()
-	.fromFile("./config.json")
-	.start();
-
-// Merge multiple sources
-const server = await createMrrowisp()
-	.fromFile("./config.json")
-	.withConfig({ port: 8080 })	// Override specific values
-	.start();
-
-// Or from a JSON config
-const server = await createMrrowisp()
-	.fromJSON('{"port": 6001, "enableV2": true}')
-	.start();
-```
-
-#### Server Control
-
-```ts
-const server = await createMrrowisp().port(6001).start();
-
-// Check if server is running
-console.log(server.running);
-
-// Access the config
-console.log(server.config);
-
-// Access the child process
-console.log(server.process.pid);
-
-// Graceful shutdown
-await server.stop();
-
-// Force kill
-server.kill();
-server.kill("SIGTERM");
-```
-
-#### Builder Methods
-
-| Method                 | Description                        |
-| ---------------------- | ---------------------------------- |
-| `fromFile(path)`       | Load config from a JSON file       |
-| `fromJSON(json)`       | Load config from a JSON string     |
-| `withConfig(config)`   | Merge a partial config object      |
-| `port(port)`           | Set the server port                |
-| `udp(enabled)`         | Enable/disable UDP support         |
-| `v2(enabled)`          | Enable/disable Wisp v2 protocol    |
-| `twisp(enabled)`       | Enable/disable terminal over wisp  |
-| `motd(message)`        | Set message of the day             |
-| `blacklist(hostnames)` | Set blocked hostnames              |
-| `whitelist(hostnames)` | Set whitelisted hostnames          |
-| `proxy(url)`           | Set SOCKS5 proxy address           |
-| `dns(server)`          | Set custom DNS server              |
-| `onReady(cb)`          | Callback when server starts        |
-| `onError(cb)`          | Callback on errors                 |
-| `onExit(cb)`           | Callback when server exits         |
-| `onStdout(cb)`         | Callback for stdout data           |
-| `onStderr(cb)`         | Callback for stderr data           |
-| `getConfig()`          | Get the current config object      |
-| `start()`              | Start the server (returns Promise) |
-
-#### Server Methods
-
-| Method           | Description                         |
-| ---------------- | ----------------------------------- |
-| `stop()`         | Graceful shutdown (returns Promise) |
-| `kill(signal?)`  | Force kill with optional signal     |
-| `on(event, cb)`  | Add event listener                  |
-| `off(event, cb)` | Remove event listener               |
-| `running`        | Whether the server is running       |
-| `config`         | The resolved configuration          |
-| `process`        | The underlying ChildProcess         |
-
-### CLI
-
-```bash
-./mrrowisp
-```
+- `new Mrrowisp(partialConfig?)` – overrides merged onto defaults loaded from
+  `dist/config.json`
+- `start(count = 1)` – spawn N worker processes, each on its own port
+- `route(req, socket, head)` – proxy a WebSocket upgrade to the next worker
+- `stop()` – `SIGTERM` all workers
+- `kill()` – `SIGKILL` all workers
 
 ## Configuration
 
-Copy `example.config.json` to `config.json` and edit as needed:
+The full schema lives in `example.config.json` and `wisp/config.go`. Featured
+keys:
 
-```json
-{
-	"port": "6001",
-	"disableUDP": false,
-	"tcpBufferSize": 65535,
-	"bufferRemainingLength": 1024,
-	"tcpNoDelay": true,
-	"websocketTcpNoDelay": true,
-	"blacklist": {
-		"hostnames": []
-	},
-	"whitelist": {
-		"hostnames": []
-	},
-	"proxy": "",
-	"websocketPermessageDeflate": false,
-	"dnsServer": "",
-	"enableTwisp": false,
-	"enableV2": true,
-	"motd": "",
-	"passwordAuth": false,
-	"passwordAuthRequired": false,
-	"passwordUsers": {},
-	"certAuth": false,
-	"certAuthRequired": false,
-	"certAuthPublicKeys": [],
-	"enableStreamConfirm": false
-}
-```
-
-### Configuration Options
-
-| Option                       | Type     | Description                                   |
-| ---------------------------- | -------- | --------------------------------------------- |
-| `port`                       | string   | Port to listen on                             |
-| `disableUDP`                 | bool     | Disable UDP stream support                    |
-| `tcpBufferSize`              | int      | TCP read buffer size                          |
-| `bufferRemainingLength`      | uint32   | Flow control buffer threshold                 |
-| `tcpNoDelay`                 | bool     | Enable TCP_NODELAY on outbound connections    |
-| `websocketTcpNoDelay`        | bool     | Enable TCP_NODELAY on WebSocket connections   |
-| `blacklist.hostnames`        | []string | Hostnames to block                            |
-| `whitelist.hostnames`        | []string | Hostnames to bypass DNS resolution            |
-| `proxy`                      | string   | SOCKS5 proxy address (e.g., `127.0.0.1:1080`) |
-| `websocketPermessageDeflate` | bool     | Enable WebSocket compression                  |
-| `dnsServer`                  | string   | Custom DNS server (e.g., `8.8.8.8:53`)        |
-| `enableTwisp`                | bool     | Enable terminal streams (Unix only)           |
-| `enableV2`                   | bool     | Enable Wisp v2 protocol                       |
-| `motd`                       | string   | Message of the day sent to v2 clients         |
-| `passwordAuth`               | bool     | Enable password authentication                |
-| `passwordAuthRequired`       | bool     | Require password authentication               |
-| `passwordUsers`              | object   | Username/password map                         |
-| `certAuth`                   | bool     | Enable Ed25519 certificate authentication     |
-| `certAuthRequired`           | bool     | Require certificate authentication            |
-| `certAuthPublicKeys`         | []string | Allowed Ed25519 public keys (hex-encoded)     |
-| `enableStreamConfirm`        | bool     | Send confirmation when streams connect        |
+| Key | Default | Description |
+| --- | --- | --- |
+| `port` | `6001` | TCP port to listen on |
+| `allowTCP` / `allowUDP` | `true` | Permit TCP/UDP stream types |
+| `allowDirectIP` | `false` | Allow connecting to literal IPs |
+| `allowPrivateIPs` | `false` | Allow RFC1918 destinations |
+| `allowLoopbackIPs` | `false` | Allow loopback destinations |
+| `enableV2` | `true` | Enable Wisp v2 extensions |
+| `enableTwisp` | `false` | Enable Twisp |
+| `passwordAuth(Required)` | `false` | Password auth |
+| `parseRealIP` | `true` | Honor `trustedHeaders` from `trustedProxies` |
+| `bandwidthLimitKbps` | `0` | Per-IP bandwidth limit (0 = off) |
+| `floodProtection` | enabled | See `example.config.json` |
+| `reputation` | enabled | Persistent IP reputation scoring |
 
 ## Credits
- - [soap phia](https://github.com/soap-phia/) - writing most of this
- - [rebecca](https://github.com/rebeccaheartz69/) - greatly helping with implementing wisp v2 and extensions
- - [ObjectAscended](https://github.com/ObjectAscended/) - writing [go-wisp](https://github.com/ObjectAscended/go-wisp/), which this was initially based off of
+
+- [soap phia](https://github.com/soap-phia/) – Writing mrrowisp
+- [Amplify](https://github.com/not-amplify/) – Adding protections against flooding
+
+## License
+
+BSD-3-Clause. See [LICENSE](./LICENSE).

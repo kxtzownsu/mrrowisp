@@ -5,59 +5,69 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-	"unsafe"
 )
 
-type writeReq struct {
-	data []byte
-	pool bool
-}
+var connIDCounter uint64
 
-type wispConnection struct {
-	netConn        net.Conn
-	writeCh        chan writeReq
-	streams        sync.Map
-	cachedStreamId uint32
-	cachedStream   unsafe.Pointer
-	isClosed       atomic.Bool
-	shutdownOnce   sync.Once
-	config         *Config
-	twispStreams   *twispRegistry
-	remoteIP       string
-
-	isV2          bool
-	handshakeDone chan struct{}
-	streamConfirm bool
-	v2Challenge   []byte
-	authenticated atomic.Bool
-
-	dialSem     chan struct{}
-	closeCh     chan struct{}
-	createdAt   time.Time
-	streamCount atomic.Int32
-}
+const streamCacheSize = 32
 
 func (c *wispConnection) close() {
 	if !c.isClosed.CompareAndSwap(false, true) {
 		return
 	}
 	c.netConn.Close()
+	close(c.closeCh)
 }
 
 func (c *wispConnection) writeLoop() {
-	for req := range c.writeCh {
-		bufs := net.Buffers{req.data}
-		n := len(c.writeCh)
-		for i := 0; i < n; i++ {
-			r := <-c.writeCh
-			bufs = append(bufs, r.data)
+	bufs := make(net.Buffers, 0, 64)
+	pooled := make([]*[]byte, 0, 64)
+
+	releasePooled := func() {
+		for _, p := range pooled {
+			c.config.ReadBufPool.Put(p)
 		}
-		if _, err := bufs.WriteTo(c.netConn); err != nil {
-			c.isClosed.Store(true)
-			c.netConn.Close()
+		pooled = pooled[:0]
+	}
+
+	for {
+		var req writeReq
+		select {
+		case req = <-c.writeCh:
+		case <-c.closeCh:
+			for {
+				select {
+				case r := <-c.writeCh:
+					if r.buf != nil {
+						pooled = append(pooled, r.buf)
+					}
+				default:
+					releasePooled()
+					return
+				}
+			}
+		}
+
+		bufs = append(bufs[:0], req.data)
+		if req.buf != nil {
+			pooled = append(pooled, req.buf)
+		}
+	drain:
+		for len(bufs) < 256 {
+			select {
+			case r := <-c.writeCh:
+				bufs = append(bufs, r.data)
+				if r.buf != nil {
+					pooled = append(pooled, r.buf)
+				}
+			default:
+				break drain
+			}
+		}
+		_, err := bufs.WriteTo(c.netConn)
+		releasePooled()
+		if err != nil {
+			c.close()
 			return
 		}
 	}
@@ -67,46 +77,26 @@ func (c *wispConnection) queueWrite(data []byte) {
 	if c.isClosed.Load() {
 		return
 	}
-	defer func() {
-		recover()
-	}()
 	select {
 	case c.writeCh <- writeReq{data: data}:
 	case <-c.closeCh:
-		return
 	}
 }
 
-func (c *wispConnection) queueWritePooled(data []byte) {
+func (c *wispConnection) queueWritePooled(data []byte, buf *[]byte) {
 	if c.isClosed.Load() {
-		c.releaseFrame(data)
-		return
-	}
-	defer func() {
-		if recover() != nil {
-			c.releaseFrame(data)
+		if buf != nil {
+			c.config.ReadBufPool.Put(buf)
 		}
-	}()
+		return
+	}
 	select {
-	case c.writeCh <- writeReq{data: data, pool: true}:
+	case c.writeCh <- writeReq{data: data, buf: buf}:
 	case <-c.closeCh:
-		c.releaseFrame(data)
-		return
+		if buf != nil {
+			c.config.ReadBufPool.Put(buf)
+		}
 	}
-}
-
-func (c *wispConnection) releaseFrame(data []byte) {
-	if c.config == nil || len(data) == 0 {
-		return
-	}
-	if cap(data) < 64*1024 {
-		return
-	}
-	buf := data
-	if len(buf) != cap(buf) {
-		buf = data[:cap(data)]
-	}
-	// cfg.config.FramePool.Put(buf)
 }
 
 func (c *wispConnection) handlePacket(packetType uint8, streamId uint32, payload []byte) {
@@ -136,16 +126,30 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 		return
 	}
 	streamType := payload[0]
-	port := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(payload[1:3])), 10)
+	portU16 := binary.LittleEndian.Uint16(payload[1:3])
+	port := strconv.FormatUint(uint64(portU16), 10)
 	hostname := string(payload[3:])
 
 	c.config.Logger.Debug("creating stream", "ip", c.remoteIP, "streamId", streamId, "hostname", hostname, "port", port, "type", streamType)
-	if streamType == streamTypeTerm {
-		if !c.config.EnableTwisp {
-			c.sendClosePacket(streamId, closeReasonBlocked)
+
+	if c.config.FloodProtection != nil && c.config.FloodProtection.MaxConcurrentStreamsPerConnection > 0 {
+		if c.streamCount.Load() >= int32(c.config.FloodProtection.MaxConcurrentStreamsPerConnection) {
+			c.violation("per_ws_streams")
+			c.sendClosePacket(streamId, closeReasonThrottled)
 			return
 		}
-		go handleTwisp(c, streamId, hostname)
+	}
+
+	if c.globals != nil && c.globals.PerSource != nil && !c.globals.PerSource.Allow(c.remoteIP) {
+		c.violation("per_source_rate")
+		c.repAddSource("burstRate")
+		c.config.Logger.Warn("flood block", "reason", "per_source_rate", "ip", c.remoteIP, "host", hostname, "port", port)
+		c.sendClosePacket(streamId, closeReasonThrottled)
+		return
+	}
+
+	if streamType == streamTypeTerm {
+		c.handleTwispConnect(streamId, hostname)
 		return
 	}
 
@@ -154,6 +158,7 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 		streamId:  streamId,
 		connReady: make(chan struct{}),
 		hostname:  strings.ToLower(strings.TrimSpace(hostname)),
+		portNum:   int(portU16),
 	}
 	stream.isOpen.Store(true)
 
@@ -166,12 +171,61 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 	go stream.handleConnect(streamType, port, hostname)
 }
 
-func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
-	var stream *wispStream
-	if c.cachedStreamId == streamId {
-		stream = (*wispStream)(atomic.LoadPointer(&c.cachedStream))
+func (c *wispConnection) handleTwispConnect(streamId uint32, command string) {
+	if !c.config.EnableTwisp {
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
 	}
-	if stream == nil {
+	if !c.isV2 {
+		c.repAddSource("twispNoAuth")
+		c.config.Logger.Warn("twisp blocked", "reason", "v1_no_auth", "ip", c.remoteIP)
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	if !c.config.PasswordAuth {
+		c.repAddSource("twispNoAuth")
+		c.config.Logger.Warn("twisp blocked", "reason", "no_auth_configured", "ip", c.remoteIP)
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	if !c.twispAuthorized() {
+		c.repAddSource("twispNoAuth")
+		c.config.Logger.Warn("twisp blocked", "reason", "not_authenticated", "ip", c.remoteIP)
+		c.sendClosePacket(streamId, closeReasonBlocked)
+		return
+	}
+	go handleTwisp(c, streamId, command)
+}
+
+func (c *wispConnection) violation(reason string) {
+	if c.config.FloodProtection == nil || c.config.FloodProtection.WsCloseAfterViolations <= 0 {
+		return
+	}
+	n := c.violations.Add(1)
+	if n >= int32(c.config.FloodProtection.WsCloseAfterViolations) {
+		c.config.Logger.Warn("ws closed for violations", "ip", c.remoteIP, "violations", n, "lastReason", reason)
+		c.close()
+	}
+}
+
+func (c *wispConnection) repAddSource(reason string) {
+	if c.globals != nil && c.globals.Reputation != nil {
+		c.globals.Reputation.AddSource(c.remoteIP, reason)
+	}
+}
+
+func (c *wispConnection) repAddDest(ip string, port int, reason string) {
+	if c.globals != nil && c.globals.Reputation != nil {
+		c.globals.Reputation.AddDest(ip, port, reason, net.ParseIP(c.remoteIP))
+	}
+}
+
+func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte, bufp *[]byte) bool {
+	slot := &c.streamCache[streamId&(streamCacheSize-1)]
+	var stream *wispStream
+	if slot.id == streamId && slot.stream != nil {
+		stream = slot.stream
+	} else {
 		v, ok := c.streams.Load(streamId)
 		if !ok {
 			if c.twispStreams != nil {
@@ -180,41 +234,55 @@ func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
 					if err := ts.writePty(payload); err != nil {
 						ts.close(closeReasonNetworkError)
 					}
-					return
+					return false
 				}
 			}
 			c.sendClosePacket(streamId, closeReasonInvalidInfo)
-			return
+			return false
 		}
 		stream = v.(*wispStream)
-		atomic.StorePointer(&c.cachedStream, unsafe.Pointer(stream))
-		c.cachedStreamId = streamId
+		slot.id = streamId
+		slot.stream = stream
 	}
 
 	if !stream.isOpen.Load() {
-		return
+		return false
 	}
 
-	stream.pendingMutex.Lock()
 	if !stream.connReadyDone.Load() {
-		if stream.pendingBytes+len(payload) > 16*1024*1024 {
+		stream.pendingMutex.Lock()
+		if !stream.connReadyDone.Load() {
+			if stream.pendingBytes+len(payload) > 16*1024*1024 {
+				stream.pendingMutex.Unlock()
+				stream.close(closeReasonThrottled)
+				return false
+			}
+			dataCopy := make([]byte, len(payload))
+			copy(dataCopy, payload)
+			stream.pendingData = append(stream.pendingData, dataCopy)
+			stream.pendingBytes += len(dataCopy)
 			stream.pendingMutex.Unlock()
-			stream.close(closeReasonThrottled)
-			return
+			return false
 		}
-		dataCopy := make([]byte, len(payload))
-		copy(dataCopy, payload)
-		stream.pendingData = append(stream.pendingData, dataCopy)
-		stream.pendingBytes += len(dataCopy)
 		stream.pendingMutex.Unlock()
-		return
 	}
-	stream.pendingMutex.Unlock()
+
+	if stream.streamType == streamTypeTCP && stream.ingressCh != nil {
+		if !stream.queueIngressOwned(payload, bufp) {
+			return false
+		}
+		stream.bufferRemaining--
+		if stream.bufferRemaining == 0 {
+			stream.bufferRemaining = c.config.BufferRemainingLength
+			c.sendPacket(streamId, stream.bufferRemaining)
+		}
+		return true
+	}
 
 	_, err := stream.conn.Write(payload)
 	if err != nil {
 		stream.close(closeReasonNetworkError)
-		return
+		return false
 	}
 
 	if stream.streamType == streamTypeTCP {
@@ -224,6 +292,7 @@ func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte) {
 			c.sendPacket(streamId, stream.bufferRemaining)
 		}
 	}
+	return false
 }
 
 func (c *wispConnection) twispAuthorized() bool {
@@ -296,8 +365,9 @@ func (c *wispConnection) writeRawPong(payload []byte) error {
 
 func (c *wispConnection) deleteWispStream(streamId uint32) {
 	c.streams.Delete(streamId)
-	if c.cachedStreamId == streamId {
-		atomic.StorePointer(&c.cachedStream, nil)
+	slot := &c.streamCache[streamId&(streamCacheSize-1)]
+	if slot.id == streamId {
+		slot.stream = nil
 	}
 	c.streamCount.Add(-1)
 }
@@ -321,6 +391,12 @@ func (c *wispConnection) deleteAllWispStreams() {
 			ts.close(closeReasonUnspecified)
 		}
 	}
-	defer func() { recover() }()
-	close(c.writeCh)
+	if c.globals != nil {
+		if c.globals.Connections != nil {
+			c.globals.Connections.Release()
+		}
+		if c.globals.Signature != nil {
+			c.globals.Signature.Forget(c.connID)
+		}
+	}
 }

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 rm -rf bin
 mkdir -p bin
@@ -30,9 +31,14 @@ for os in linux darwin win32; do
     done
 done
 
-echo "Finished building to ./bin/"
+echo "Finished building binaries to ./bin/"
 
-cp package.json README.md LICENSE dist/
+if [ ! -d "dist" ]; then
+    echo "dist/ not found; run 'pnpm run compile' first." >&2
+    exit 1
+fi
+
 cp example.config.json dist/config.json
+cp LICENSE README.md dist/ 2>/dev/null || true
 
 echo "Finished copying package files to ./dist/"

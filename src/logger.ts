@@ -1,37 +1,42 @@
 import chalk from "chalk";
 
-export type LogLevel = "debug" | "warn" | "error" | "info" | "none";
+export type LogLevel = "debug" | "info" | "warn" | "error" | "none";
 
 const levelPriority: Record<LogLevel, number> = {
 	debug: 0,
-	warn: 1,
-	error: 2,
-	info: 3,
+	info: 1,
+	warn: 2,
+	error: 3,
 	none: 4,
 };
 
 class Logger {
 	level: LogLevel = "info";
 
-	private shouldLog(method: LogLevel): boolean {
+	private shouldLog(method: Exclude<LogLevel, "none">): boolean {
 		return levelPriority[method] >= levelPriority[this.level];
 	}
 
-	info(message: string) {
+	private write(message: string, color: string, index?: number) {
+		const tag = index !== undefined ? `mrrowisp-${index}` : "mrrowisp";
+		console.log(chalk.bold(chalk.hex(color)(`[${tag}]: ${message}`)));
+	}
+
+	info(message: string, index?: number) {
 		if (!this.shouldLog("info")) return;
-		console.log(chalk.bold(chalk.hex("#ebaaee")(`[mrrowisp]: ${message}`)));
+		this.write(message, "#ebaaee", index);
 	}
-	error(message: string) {
+	error(message: string, index?: number) {
 		if (!this.shouldLog("error")) return;
-		console.log(chalk.bold(chalk.hex("#f38fad")(`[mrrowisp]: ${message}`)));
+		this.write(message, "#f38fad", index);
 	}
-	warn(message: string) {
+	warn(message: string, index?: number) {
 		if (!this.shouldLog("warn")) return;
-		console.log(chalk.bold(chalk.hex("#f9dca1")(`[mrrowisp]: ${message}`)));
+		this.write(message, "#f9dca1", index);
 	}
-	debug(message: string) {
+	debug(message: string, index?: number) {
 		if (!this.shouldLog("debug")) return;
-		console.log(chalk.bold(chalk.hex("#89b4fa")(`[mrrowisp]: ${message}`)));
+		this.write(message, "#89b4fa", index);
 	}
 }
 

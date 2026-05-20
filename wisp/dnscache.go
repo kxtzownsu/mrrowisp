@@ -4,35 +4,8 @@ import (
 	"context"
 	"net"
 	"strings"
-	"sync"
 	"time"
-
-	"golang.org/x/sync/singleflight"
 )
-
-type dnsEntry struct {
-	ips       []net.IPAddr
-	expiresAt time.Time
-	err       error
-}
-
-type DNSCacheConfig struct {
-	Servers     []string
-	TTLSeconds  int
-	Method      string
-	ResultOrder string
-}
-
-type DNSCache struct {
-	servers     []string
-	resolver    *net.Resolver
-	ttl         time.Duration
-	resultOrder string
-
-	mu    sync.RWMutex
-	cache map[string]dnsEntry
-	group singleflight.Group
-}
 
 func NewDNSCache(cfg DNSCacheConfig) *DNSCache {
 	ttl := time.Duration(cfg.TTLSeconds) * time.Second

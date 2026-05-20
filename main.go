@@ -18,6 +18,8 @@ func main() {
 	fPort := flag.Int("port", 0, "port to run on")
 	fAllowLoopbackIPs := flag.Bool("allow-loopback", false, "allow loopback IP targets")
 	flag.Parse()
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
 	var cfg wisp.Config
 	var err error
@@ -35,7 +37,7 @@ func main() {
 	if *fPort != 0 {
 		cfg.Port = *fPort
 	}
-	if *fAllowLoopbackIPs != false {
+	if setFlags["allow-loopback"] {
 		cfg.AllowLoopbackIPs = *fAllowLoopbackIPs
 	}
 

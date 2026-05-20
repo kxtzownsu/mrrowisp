@@ -6,29 +6,51 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
 )
 
-type wispStream struct {
-	wispConn *wispConnection
+const (
+	ingressPoolNone ingressPool = iota
+	ingressPoolWS
+	ingressPoolCopy
+)
 
-	streamId        uint32
-	streamType      uint8
-	conn            net.Conn
-	bufferRemaining uint32
-	hostname        string
+func releaseIngressJob(j ingressJob) {
+	if j.bufp == nil {
+		return
+	}
+	switch j.pool {
+	case ingressPoolWS:
+		putWSPayloadBuf(j.bufp)
+	case ingressPoolCopy:
+		putIngressBuf(j.bufp)
+	}
+}
 
-	connReady     chan struct{}
-	connReadyDone atomic.Bool
+var ingressBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 256*1024)
+		return &buf
+	},
+}
 
-	isOpen atomic.Bool
+func getIngressBuf(size int) *[]byte {
+	bufp := ingressBufPool.Get().(*[]byte)
+	if cap(*bufp) < size {
+		nb := make([]byte, size)
+		return &nb
+	}
+	*bufp = (*bufp)[:size]
+	return bufp
+}
 
-	pendingMutex sync.Mutex
-	pendingData  [][]byte
-	pendingBytes int
+func putIngressBuf(bufp *[]byte) {
+	if bufp == nil || cap(*bufp) == 0 {
+		return
+	}
+	ingressBufPool.Put(bufp)
 }
 
 const dnsLookupTimeout = 10 * time.Second
@@ -57,8 +79,22 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	}
 
+	policy := PolicyFromConfig(cfg)
+
 	resolvedHostname := hostname
-	if cfg.DNSCache != nil {
+	if ip := net.ParseIP(hostname); ip != nil {
+		if !cfg.AllowDirectIP {
+			cfg.Logger.Warn("egress block: direct IP", "ip", s.wispConn.remoteIP, "dstIP", ip.String(), "port", port)
+			s.close(closeReasonBlocked)
+			return
+		}
+		if ok, reason := policy.Evaluate(ip); !ok {
+			cfg.Logger.Warn("egress block", "ip", s.wispConn.remoteIP, "dstIP", ip.String(), "port", port, "reason", reason)
+			s.close(closeReasonBlocked)
+			return
+		}
+		resolvedHostname = ip.String()
+	} else if cfg.DNSCache != nil {
 		if _, whitelisted := cfg.Whitelist.Hostnames[hostname]; !whitelisted {
 			ips, err := cfg.DNSCache.LookupIPAddr(context.Background(), hostname)
 			if err != nil {
@@ -69,8 +105,68 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 				s.close(closeReasonUnreachable)
 				return
 			}
-			resolvedHostname = ips[0].IP.String()
+			pickedReason := ""
+			picked := false
+			for _, ipa := range ips {
+				if ok, reason := policy.Evaluate(ipa.IP); ok {
+					resolvedHostname = ipa.IP.String()
+					pickedReason = ""
+					picked = true
+					break
+				} else {
+					pickedReason = reason
+				}
+			}
+			if !picked {
+				cfg.Logger.Warn("egress block", "ip", s.wispConn.remoteIP, "host", hostname, "port", port, "reason", pickedReason)
+				s.close(closeReasonBlocked)
+				return
+			}
 		}
+	}
+
+	c := s.wispConn
+
+	// Per-destination rate caps.
+	dstKey := net.JoinHostPort(resolvedHostname, port)
+	if c.globals != nil {
+		if c.globals.PerDestSec != nil && !c.globals.PerDestSec.Allow(dstKey) {
+			c.violation("per_dest_sec")
+			c.repAddSource("burstRate")
+			c.repAddDest(resolvedHostname, s.portNum, "burstRate")
+			cfg.Logger.Warn("flood block", "reason", "per_dest_sec", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonThrottled)
+			return
+		}
+		if c.globals.PerDestMin != nil && !c.globals.PerDestMin.Allow(dstKey) {
+			c.violation("per_dest_min")
+			cfg.Logger.Warn("flood block", "reason", "per_dest_min", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonThrottled)
+			return
+		}
+	}
+
+	// Reputation-strict destination check.
+	if c.globals != nil && c.globals.Reputation != nil {
+		ds := c.globals.Reputation.DestScore(resolvedHostname, s.portNum)
+		if c.globals.Reputation.Tier(ds) == TierStrict {
+			c.repAddSource("requestKnownBadDest")
+			cfg.Logger.Warn("flood block", "reason", "dest_reputation_strict", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonBlocked)
+			return
+		}
+	}
+
+	// In-flight SYN cap.
+	synAcquired := false
+	if c.globals != nil && c.globals.InFlightSyns != nil && streamType == streamTypeTCP {
+		if !c.globals.InFlightSyns.TryAcquire() {
+			c.violation("in_flight_syns")
+			cfg.Logger.Warn("flood block", "reason", "in_flight_syns", "ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			s.close(closeReasonThrottled)
+			return
+		}
+		synAcquired = true
 	}
 
 	s.streamType = streamType
@@ -88,6 +184,9 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 			dialer, proxyErr := proxy.SOCKS5("tcp", stripScheme(proxyURL), nil, proxy.Direct)
 			if proxyErr != nil {
 				cfg.Logger.Warn("proxy dialer creation failed", "ip", s.wispConn.remoteIP, "error", proxyErr)
+				if synAcquired {
+					c.globals.InFlightSyns.Release()
+				}
 				s.close(closeReasonNetworkError)
 				return
 			}
@@ -97,13 +196,40 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	case streamTypeUDP:
 		if cfg.Proxy != "" || !cfg.AllowUDP {
+			if synAcquired {
+				c.globals.InFlightSyns.Release()
+			}
 			s.close(closeReasonBlocked)
 			return
 		}
 		s.conn, err = net.Dial("udp", destination)
 	default:
+		if synAcquired {
+			c.globals.InFlightSyns.Release()
+		}
 		s.close(closeReasonInvalidInfo)
 		return
+	}
+
+	if synAcquired {
+		c.globals.InFlightSyns.Release()
+	}
+
+	if c.globals != nil && c.globals.Signature != nil && streamType == streamTypeTCP {
+		det := c.globals.Signature.For(c.connID, resolvedHostname, s.portNum)
+		det.Record(err == nil)
+		if det.Match() {
+			c.repAddSource("synSignature")
+			c.repAddDest(resolvedHostname, s.portNum, "synSignature")
+			cfg.Logger.Warn("syn-flood signature matched; closing WS",
+				"ip", c.remoteIP, "dstIP", resolvedHostname, "port", port)
+			if err == nil && s.conn != nil {
+				s.conn.Close()
+			}
+			s.close(closeReasonBlocked)
+			c.close()
+			return
+		}
 	}
 
 	if err != nil {
@@ -115,8 +241,8 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 	if streamType == streamTypeTCP {
 		if tc, ok := s.conn.(*net.TCPConn); ok {
 			tc.SetNoDelay(cfg.TcpNoDelay)
-			tc.SetReadBuffer(1 << 20)
-			tc.SetWriteBuffer(1 << 20)
+			tc.SetReadBuffer(4 << 20)
+			tc.SetWriteBuffer(4 << 20)
 		}
 	}
 
@@ -140,7 +266,10 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	}
 
-	// Signal ready only after all pending data has been written in order.
+	if streamType == streamTypeTCP {
+		s.startIngressWriter()
+	}
+
 	s.signalConnReady()
 
 	s.readFromConnection()
@@ -159,15 +288,103 @@ func (s *wispStream) signalConnReady() {
 	}
 }
 
+func (s *wispStream) startIngressWriter() {
+	if s.ingressCh != nil {
+		return
+	}
+	s.ingressCh = make(chan ingressJob, 64)
+	go func() {
+		bufs := make(net.Buffers, 0, 32)
+		jobs := make([]ingressJob, 0, 32)
+		flushReleases := func() {
+			for i := range jobs {
+				releaseIngressJob(jobs[i])
+			}
+			jobs = jobs[:0]
+		}
+
+		for first := range s.ingressCh {
+			bufs = append(bufs[:0], first.payload)
+			jobs = append(jobs, first)
+		drain:
+			for len(bufs) < 32 {
+				select {
+				case more, ok := <-s.ingressCh:
+					if !ok {
+						break drain
+					}
+					bufs = append(bufs, more.payload)
+					jobs = append(jobs, more)
+				default:
+					break drain
+				}
+			}
+			if !s.isOpen.Load() {
+				flushReleases()
+				continue
+			}
+			_, err := bufs.WriteTo(s.conn)
+			flushReleases()
+			if err != nil {
+				s.close(closeReasonNetworkError)
+				for extra := range s.ingressCh {
+					releaseIngressJob(extra)
+				}
+				return
+			}
+		}
+	}()
+}
+
+func (s *wispStream) queueIngress(payload []byte) bool {
+	if s.ingressCh == nil || !s.isOpen.Load() {
+		return false
+	}
+	bufp := getIngressBuf(len(payload))
+	copy(*bufp, payload)
+	job := ingressJob{
+		payload: *bufp,
+		bufp:    bufp,
+		pool:    ingressPoolCopy,
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			putIngressBuf(bufp)
+		}
+	}()
+	s.ingressCh <- job
+	return true
+}
+
+func (s *wispStream) queueIngressOwned(payload []byte, bufp *[]byte) bool {
+	if s.ingressCh == nil || !s.isOpen.Load() {
+		putWSPayloadBuf(bufp)
+		return false
+	}
+	job := ingressJob{
+		payload: payload,
+		bufp:    bufp,
+		pool:    ingressPoolWS,
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			putWSPayloadBuf(bufp)
+		}
+	}()
+	s.ingressCh <- job
+	return true
+}
+
 func (s *wispStream) readFromConnection() {
 	const maxHeaderLen = 15
-	bufp := s.wispConn.config.ReadBufPool.Get().(*[]byte)
-	buf := *bufp
-	defer s.wispConn.config.ReadBufPool.Put(bufp)
 
+	pool := s.wispConn.config.ReadBufPool
 	streamId := s.streamId
 
+	bufp := pool.Get().(*[]byte)
+
 	for {
+		buf := *bufp
 		n, err := s.conn.Read(buf[maxHeaderLen:])
 		if n > 0 {
 			totalPayload := 5 + n
@@ -204,11 +421,13 @@ func (s *wispStream) readFromConnection() {
 			buf[wispStart+3] = byte(streamId >> 16)
 			buf[wispStart+4] = byte(streamId >> 24)
 
-			frame := make([]byte, maxHeaderLen+n-frameStart)
-			copy(frame, buf[frameStart:maxHeaderLen+n])
-			s.wispConn.queueWritePooled(frame)
+			frame := buf[frameStart : maxHeaderLen+n]
+			handoff := bufp
+			bufp = pool.Get().(*[]byte)
+			s.wispConn.queueWritePooled(frame, handoff)
 		}
 		if err != nil {
+			pool.Put(bufp)
 			if err == io.EOF {
 				s.close(closeReasonVoluntary)
 			} else {
@@ -231,6 +450,11 @@ func (s *wispStream) close(reason uint8) {
 
 	if s.conn != nil {
 		s.conn.Close()
+	}
+
+	if s.ingressCh != nil {
+		defer func() { recover() }()
+		close(s.ingressCh)
 	}
 
 	s.wispConn.sendClosePacket(s.streamId, reason)

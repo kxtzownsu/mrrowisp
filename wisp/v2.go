@@ -4,23 +4,28 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
-var errorInvalid = errors.New("invalid wisp v2 payload")
+var plaintextWarned atomic.Bool
 
-type extensions struct {
-	udp           bool
-	streamConfirm bool
-
-	passwordUsername string
-	passwordPassword string
-
-	certificateUsername   string
-	certificateSelected   uint8
-	certificatePubkeyHash [32]byte
-	certificateSig        []byte
+func checkPassword(logger Logger, stored, provided string) bool {
+	if strings.HasPrefix(stored, "$2a$") || strings.HasPrefix(stored, "$2b$") || strings.HasPrefix(stored, "$2y$") {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(provided)) == nil
+	}
+	if !plaintextWarned.Swap(true) && logger != nil {
+		logger.Warn("plaintext passwords in passwordUsers are deprecated; use bcrypt hashes ($2a$/$2b$)")
+	}
+	expBytes := []byte(stored)
+	gotBytes := []byte(provided)
+	return len(expBytes) == len(gotBytes) && subtle.ConstantTimeCompare(expBytes, gotBytes) == 1
 }
+
+var errorInvalid = errors.New("invalid wisp v2 payload")
 
 func (c *wispConnection) buildServerInfoPacket() []byte {
 	var extensions []byte
@@ -60,12 +65,12 @@ func addExtension(buf []byte, id uint8, metadata []byte) []byte {
 	return append(buf, entry...)
 }
 
-func parseClientInfo(payload []byte) (*extensions, error) {
+func parseClientInfo(payload []byte) (*Extensions, error) {
 	if len(payload) < 2 {
 		return nil, errorInvalid
 	}
 
-	exts := &extensions{}
+	exts := &Extensions{}
 	data := payload[2:]
 
 	for len(data) >= 5 {
@@ -151,10 +156,7 @@ func (c *wispConnection) handleInfo(streamId uint32, payload []byte) {
 
 	if c.config.PasswordAuth && clientExts.passwordUsername != "" {
 		expectedPassword, userExists := c.config.PasswordUsers[clientExts.passwordUsername]
-		expBytes := []byte(expectedPassword)
-		gotBytes := []byte(clientExts.passwordPassword)
-		ok := userExists && len(expBytes) == len(gotBytes) && subtle.ConstantTimeCompare(expBytes, gotBytes) == 1
-		if ok {
+		if userExists && checkPassword(c.config.Logger, expectedPassword, clientExts.passwordPassword) {
 			authPassed = true
 		} else {
 			c.sendClosePacket(0, closeReasonAuthBadPassword)

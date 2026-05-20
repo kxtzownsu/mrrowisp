@@ -6,7 +6,6 @@
 		"moduleResolution": "NodeNext",
 		"target": "esnext",
 		"types": [
-			"bun",
 			"node"
 		],
 		"sourceMap": true,

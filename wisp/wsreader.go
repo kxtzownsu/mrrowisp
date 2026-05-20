@@ -4,15 +4,40 @@ import (
 	"bufio"
 	"encoding/binary"
 	"io"
+	"sync"
 	"unsafe"
 )
 
+const wsPayloadPoolSize = 256 * 1024
+
+var wsPayloadPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, wsPayloadPoolSize)
+		return &buf
+	},
+}
+
+func getWSPayloadBuf(size int) *[]byte {
+	bufp := wsPayloadPool.Get().(*[]byte)
+	if cap(*bufp) < size {
+		nb := make([]byte, size)
+		return &nb
+	}
+	*bufp = (*bufp)[:size]
+	return bufp
+}
+
+func putWSPayloadBuf(bufp *[]byte) {
+	if bufp == nil || cap(*bufp) == 0 {
+		return
+	}
+	wsPayloadPool.Put(bufp)
+}
+
 func (c *wispConnection) readLoop() {
 	defer c.deleteAllWispStreams()
-	reader := bufio.NewReaderSize(c.netConn, 64*1024)
+	reader := bufio.NewReaderSize(c.netConn, 512*1024)
 
-	const PayloadBufferSize = 256 * 1024
-	PayloadBuffer := make([]byte, PayloadBufferSize)
 	var headerBuffer [14]byte
 
 	for {
@@ -65,15 +90,12 @@ func (c *wispConnection) readLoop() {
 			return
 		}
 
-		var payload []byte
-		if payloadLen <= PayloadBufferSize {
-			payload = PayloadBuffer[:payloadLen]
-		} else {
-			payload = make([]byte, payloadLen)
-		}
+		bufp := getWSPayloadBuf(int(payloadLen))
+		payload := (*bufp)[:payloadLen]
 
 		if payloadLen > 0 {
 			if _, err := io.ReadFull(reader, payload); err != nil {
+				putWSPayloadBuf(bufp)
 				return
 			}
 		}
@@ -82,9 +104,10 @@ func (c *wispConnection) readLoop() {
 			maskXOR(payload, maskKey)
 		}
 
+		keep := false
 		switch opcode {
-		case 0x2:
-			c.handleWispFrame(payload)
+		case 0x2, 0x1:
+			keep = c.handleWispFrame(payload, bufp)
 
 		case 0x9:
 			_ = c.writeRawPong(payload)
@@ -96,20 +119,15 @@ func (c *wispConnection) readLoop() {
 			} else {
 				c.sendWSClose(1000)
 			}
+			putWSPayloadBuf(bufp)
 			return
-
-		case 0xA:
-			continue
-
-		case 0x1:
-			c.handleWispFrame(payload)
-
 		default:
-			if opcode != 0x0 {
-			}
 			continue
 		}
 
+		if !keep {
+			putWSPayloadBuf(bufp)
+		}
 	}
 }
 
@@ -122,9 +140,9 @@ func (c *wispConnection) maxPayloadSize() uint64 {
 	return DefaultMaxPayloadSize
 }
 
-func (c *wispConnection) handleWispFrame(packet []byte) {
+func (c *wispConnection) handleWispFrame(packet []byte, bufp *[]byte) bool {
 	if len(packet) < 5 {
-		return
+		return false
 	}
 
 	packetType := packet[0]
@@ -137,21 +155,21 @@ func (c *wispConnection) handleWispFrame(packet []byte) {
 		default:
 			if packetType == packetTypeInfo {
 				c.handlePacket(packetType, streamId, payload)
-				return
+				return false
 			}
 			if packetType == packetTypeClose && streamId == 0 {
 				c.handlePacket(packetType, streamId, payload)
-				return
+				return false
 			}
-			return
+			return false
 		}
 	}
 
 	if packetType == packetTypeData {
-		c.handleDataPacket(streamId, payload)
-	} else {
-		c.handlePacket(packetType, streamId, payload)
+		return c.handleDataPacket(streamId, payload, bufp)
 	}
+	c.handlePacket(packetType, streamId, payload)
+	return false
 }
 
 func maskXOR(b []byte, key [4]byte) {
