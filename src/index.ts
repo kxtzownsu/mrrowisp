@@ -44,7 +44,7 @@ type ReputationConfig = {
 
 type MrrowispConfig = {
 	/** TCP port the server listens on. */
-	port: number;
+	port: number | number[];
 	/** Allow clients to open TCP streams. */
 	allowTCP: boolean;
 	/** Allow clients to open UDP streams. */
@@ -159,11 +159,15 @@ export class Mrrowisp {
 		this.processes = [];
 		this.processPorts = [];
 
-		let nextPort = this.config.port;
-
 		for (let i = 0; i < count; i++) {
-			const port = await this.getAvailablePort(nextPort);
-			nextPort = port + 1;
+			if (Array.isArray(this.config.port) ? !this.config.port[i] : !this.config.port) {
+				logger.error("mrrowisp: port is not configured!! >w<");
+				return;
+			}
+			const nextPort = Array.isArray(this.config.port)
+				? (this.config.port[i] ?? this.config.port[this.config.port.length - 1])
+				: this.config.port;
+			const port = await this.getAvailablePort(nextPort!);
 
 			const proc = spawn(
 				binPath,
